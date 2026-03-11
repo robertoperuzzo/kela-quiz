@@ -7,8 +7,14 @@ uses a GitHub Copilot LLM to extract and structure multiple-choice questions,
 and writes one JSON file per professor to the output directory.
 
 Usage:
+    # With GitHub Models API (default):
     python extract.py --professor all --output-dir ../data
     python extract.py --professor malusa --model gpt-4o --output-dir ../data
+
+    # With copilot-api proxy (access to Claude, GPT-5.x, etc.):
+    #   1. Start proxy:  npx copilot-api@latest start
+    #   2. Run extraction:
+    python extract.py --base-url http://localhost:4141/v1 --model claude-sonnet-4.5 --professor all
 
 Environment:
     GITHUB_TOKEN  Your GitHub personal access token with Copilot access
@@ -289,7 +295,13 @@ def main():
     parser.add_argument(
         "--model",
         default="gpt-4o",
-        help='GitHub Copilot model to use (e.g. gpt-4o, claude-3.5-sonnet). Default: gpt-4o',
+        help='Model to use (e.g. gpt-4o, claude-sonnet-4.5, gpt-5.1). Default: gpt-4o',
+    )
+    parser.add_argument(
+        "--base-url",
+        default="https://models.inference.ai.azure.com",
+        help='API base URL. Use http://localhost:4141/v1 with copilot-api proxy. '
+             'Default: https://models.inference.ai.azure.com',
     )
     parser.add_argument(
         "--output-dir",
@@ -310,7 +322,7 @@ def main():
         sys.exit(1)
 
     client = OpenAI(
-        base_url="https://models.inference.ai.azure.com",
+        base_url=args.base_url,
         api_key=token,
     )
 
