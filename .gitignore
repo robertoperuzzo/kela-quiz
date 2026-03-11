@@ -1,0 +1,35 @@
+# Node
+node_modules/
+dist/
+.svelte-kit/
+app/.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+extraction/__pycache__/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Environment
+.env
+.env.local
+extraction/.env
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data and knowledge base content (keep folders, ignore contents)
+/data/*
+!/data/.gitkeep
+/knoledgebase/*
+!/knoledgebase/.gitkeep

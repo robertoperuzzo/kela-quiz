@@ -1,0 +1,6 @@
+pymupdf
+python-docx
+odfpy
+openai
+jsonschema
+python-dotenv

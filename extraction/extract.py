@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+kela-quiz extraction pipeline.
+
+Reads source documents (PDF, DOCX, ODT) from knoledgebase/<professor>/,
+uses a GitHub Copilot LLM to extract and structure multiple-choice questions,
+and writes one JSON file per professor to the output directory.
+
+Usage:
+    python extract.py --professor all --output-dir ../data
+    python extract.py --professor malusa --model gpt-4o --output-dir ../data
+
+Environment:
+    GITHUB_TOKEN  Your GitHub personal access token with Copilot access
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env from the same directory as this script
+load_dotenv(Path(__file__).parent / ".env")
+
+import fitz  # pymupdf
+import jsonschema
+from docx import Document as DocxDocument
+from odf import text as odf_text
+from odf.opendocument import load as odf_load
+from openai import OpenAI
+
+# ─── Schema ──────────────────────────────────────────────────────────────────
+
+QUESTION_SCHEMA = {
+    "type": "object",
+    "required": ["id", "question", "alternatives", "correct", "generated"],
+    "properties": {
+        "id": {"type": "integer"},
+        "question": {"type": "string", "minLength": 1},
+        "alternatives": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 2,
+            "maxItems": 4,
+        },
+        "correct": {"type": "integer", "minimum": 0, "maximum": 3},
+        "generated": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "required": ["professor", "questions"],
+    "properties": {
+        "professor": {"type": "string"},
+        "questions": {"type": "array", "items": QUESTION_SCHEMA},
+    },
+}
+
+# ─── Text extraction ──────────────────────────────────────────────────────────
+
+def extract_text_pdf(path: Path) -> str:
+    """Extract text from a PDF file using pymupdf."""
+    doc = fitz.open(str(path))
+    pages = [page.get_text() for page in doc]
+    doc.close()
+    return "\n".join(pages)
+
+
+def extract_text_docx(path: Path) -> str:
+    """Extract text from a DOCX file using python-docx."""
+    doc = DocxDocument(str(path))
+    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+
+def extract_text_odt(path: Path) -> str:
+    """Extract text from an ODT file using odfpy."""
+    doc = odf_load(str(path))
+    paragraphs = doc.getElementsByType(odf_text.P)
+    lines = []
+    for p in paragraphs:
+        text = ""
+        for node in p.childNodes:
+            if hasattr(node, "data"):
+                text += node.data
+        if text.strip():
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def extract_text(path: Path) -> str:
+    """Dispatch to the correct extractor based on file extension."""
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return extract_text_pdf(path)
+    elif suffix == ".docx":
+        return extract_text_docx(path)
+    elif suffix == ".odt":
+        return extract_text_odt(path)
+    else:
+        raise ValueError(f"Unsupported file type: {suffix}")
+
+
+# ─── LLM extraction ──────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """Sei un assistente esperto nell'estrazione strutturata di domande d'esame universitario in italiano.
+
+Il tuo compito è leggere il testo fornito ed estrarre TUTTE le domande a risposta multipla.
+
+Per ogni domanda, restituisci un oggetto JSON con questa struttura:
+{
+  "question": "testo della domanda",
+  "alternatives": ["opzione A", "opzione B", "opzione C", "opzione D"],
+  "correct": 0,  // indice 0-based dell'alternativa corretta nell'array alternatives
+  "generated": false  // true se hai GENERATO tu le alternative sbagliate
+}
+
+Regole:
+1. Estrai TUTTE le domande presenti nel testo.
+2. Se nel testo ci sono già le alternative (corretta + sbagliate), usale tutte. Metti sempre quella corretta nell'array e segna correct con il suo indice.
+3. Se nel testo c'è SOLO la risposta corretta (senza alternative sbagliate), GENERA tu 3 alternative sbagliate plausibili ma errate in italiano. In questo caso imposta "generated": true.
+4. Ogni domanda deve avere esattamente 4 alternative.
+5. Le alternative devono essere frasi complete e grammaticalmente corrette in italiano.
+6. NON includere lettere come "A)", "B)" nelle alternative — solo il testo puro.
+7. Restituisci SOLO un array JSON valido, senza altro testo.
+
+Esempio di output:
+[
+  {
+    "question": "Qual è la capitale d'Italia?",
+    "alternatives": ["Roma", "Milano", "Napoli", "Torino"],
+    "correct": 0,
+    "generated": false
+  }
+]
+"""
+
+
+def extract_questions_with_llm(
+    text: str, client: OpenAI, model: str, professor: str, source_file: str
+) -> list[dict]:
+    """Send extracted text to the LLM and parse the structured questions."""
+    user_prompt = f"""Estrai tutte le domande d'esame dal seguente testo (professore: {professor}, file: {source_file}):
+
+---
+{text}
+---
+
+Restituisci SOLO l'array JSON con le domande strutturate."""
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+    )
+
+    raw = response.choices[0].message.content.strip()
+
+    # Strip markdown code fences if present
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        questions = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"  ⚠ JSON parse error for {source_file}: {e}", file=sys.stderr)
+        print(f"  Raw response:\n{raw[:500]}", file=sys.stderr)
+        return []
+
+    if not isinstance(questions, list):
+        print(f"  ⚠ Expected list, got {type(questions)} for {source_file}", file=sys.stderr)
+        return []
+
+    return questions
+
+
+# ─── Validation ──────────────────────────────────────────────────────────────
+
+def validate_question(q: dict, idx: int) -> dict | None:
+    """Validate and normalise a single question dict. Returns None if invalid."""
+    try:
+        jsonschema.validate(q, QUESTION_SCHEMA)
+        return q
+    except jsonschema.ValidationError as e:
+        print(f"  ⚠ Question {idx} failed validation: {e.message}", file=sys.stderr)
+        return None
+
+
+def validate_output(data: dict) -> None:
+    jsonschema.validate(data, OUTPUT_SCHEMA)
+
+
+# ─── Aggregation ─────────────────────────────────────────────────────────────
+
+def process_professor(
+    professor: str,
+    knoledgebase_dir: Path,
+    output_dir: Path,
+    client: OpenAI,
+    model: str,
+) -> int:
+    """Process all documents for a professor. Returns number of questions extracted."""
+    prof_dir = knoledgebase_dir / professor
+    if not prof_dir.is_dir():
+        print(f"⚠ Directory not found: {prof_dir}", file=sys.stderr)
+        return 0
+
+    supported = {".pdf", ".docx", ".odt"}
+    files = [f for f in prof_dir.iterdir() if f.suffix.lower() in supported]
+
+    if not files:
+        print(f"⚠ No supported files found in {prof_dir}", file=sys.stderr)
+        return 0
+
+    print(f"\n📚 Processing professor: {professor} ({len(files)} file(s))")
+
+    all_questions = []
+    q_id = 1
+
+    for f in sorted(files):
+        print(f"  📄 Extracting text from: {f.name}")
+        try:
+            text = extract_text(f)
+        except Exception as e:
+            print(f"  ⚠ Failed to extract text from {f.name}: {e}", file=sys.stderr)
+            continue
+
+        if not text.strip():
+            print(f"  ⚠ No text found in {f.name}", file=sys.stderr)
+            continue
+
+        print(f"  🤖 Sending to LLM ({model})...")
+        raw_questions = extract_questions_with_llm(text, client, model, professor, f.name)
+
+        valid = 0
+        for q in raw_questions:
+            q["id"] = q_id
+            validated = validate_question(q, q_id)
+            if validated:
+                all_questions.append(validated)
+                q_id += 1
+                valid += 1
+
+        print(f"  ✓ Extracted {valid} valid questions from {f.name}")
+
+    output_data = {"professor": professor, "questions": all_questions}
+
+    try:
+        validate_output(output_data)
+    except jsonschema.ValidationError as e:
+        print(f"⚠ Output validation failed for {professor}: {e.message}", file=sys.stderr)
+
+    out_path = output_dir / f"{professor}.json"
+    out_path.write_text(json.dumps(output_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"  💾 Saved {len(all_questions)} questions → {out_path}")
+
+    # Report generated alternatives
+    generated = [q for q in all_questions if q.get("generated")]
+    if generated:
+        print(f"  ⚠ {len(generated)} question(s) have AI-generated alternatives — review recommended:")
+        for q in generated:
+            print(f"     • [{q['id']}] {q['question'][:80]}...")
+
+    return len(all_questions)
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+
+KNOWN_PROFESSORS = ["malusa", "messetti", "zoccante"]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extract quiz questions from source documents using a GitHub Copilot LLM."
+    )
+    parser.add_argument(
+        "--professor",
+        default="all",
+        help='Professor name (e.g. "malusa") or "all" to process all. Default: all',
+    )
+    parser.add_argument(
+        "--model",
+        default="gpt-4o",
+        help='GitHub Copilot model to use (e.g. gpt-4o, claude-3.5-sonnet). Default: gpt-4o',
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="../data",
+        help='Output directory for JSON files. Default: ../data',
+    )
+    parser.add_argument(
+        "--knoledgebase-dir",
+        default="../knoledgebase",
+        help='Path to knoledgebase directory. Default: ../knoledgebase',
+    )
+    args = parser.parse_args()
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("❌ GITHUB_TOKEN environment variable not set.", file=sys.stderr)
+        print("   Set it to your GitHub personal access token with Copilot access.", file=sys.stderr)
+        sys.exit(1)
+
+    client = OpenAI(
+        base_url="https://models.inference.ai.azure.com",
+        api_key=token,
+    )
+
+    knoledgebase_dir = Path(args.knoledgebase_dir).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.professor == "all":
+        professors = KNOWN_PROFESSORS
+    else:
+        professors = [args.professor]
+
+    total = 0
+    for prof in professors:
+        total += process_professor(prof, knoledgebase_dir, output_dir, client, args.model)
+
+    print(f"\n✅ Done! Total questions extracted: {total}")
+
+
+if __name__ == "__main__":
+    main()
