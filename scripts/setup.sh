@@ -36,7 +36,7 @@ git clone "$REPO_URL" "$APP_DIR"
 cd "$APP_DIR"
 
 echo ""
-echo "✅ Setup complete!"
+echo "Setup complete!"
 echo ""
 echo "Next steps:"
 echo "  1. Copy data JSON files to the LXC (run this from your Mac):"
