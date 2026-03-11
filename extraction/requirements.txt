@@ -4,3 +4,4 @@ odfpy
 openai
 jsonschema
 python-dotenv
+pillow

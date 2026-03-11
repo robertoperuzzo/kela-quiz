@@ -2,9 +2,11 @@
 """
 kela-quiz extraction pipeline.
 
-Reads source documents (PDF, DOCX, ODT) from knoledgebase/<professor>/,
+Reads source documents (PDF, DOCX, ODT, PNG) from knoledgebase/<professor>/,
 uses a GitHub Copilot LLM to extract and structure multiple-choice questions,
 and writes one JSON file per professor to the output directory.
+
+The output JSON is always deleted and fully regenerated on each run.
 
 Usage:
     # With GitHub Models API (default):
@@ -21,6 +23,7 @@ Environment:
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -67,6 +70,101 @@ OUTPUT_SCHEMA = {
         "questions": {"type": "array", "items": QUESTION_SCHEMA},
     },
 }
+
+# ─── Image helpers ────────────────────────────────────────────────────────────
+
+IMAGE_SYSTEM_PROMPT = """Sei un assistente esperto nell'estrazione strutturata di domande d'esame universitario in italiano.
+
+Ti vengono mostrate immagini di screenshot di un documento Word con domande a risposta multipla.
+Le risposte corrette sono evidenziate in GIALLO nel documento.
+
+Per ogni domanda visibile, estrai:
+- Il testo della domanda
+- Tutte le alternative (A, B, C, D) come testo puro senza la lettera
+- La risposta corretta (quella evidenziata in giallo), indicata come indice 0-based nell'array alternatives
+
+Restituisci SOLO un array JSON valido con questa struttura:
+[
+  {
+    "question": "testo della domanda",
+    "alternatives": ["opzione A", "opzione B", "opzione C", "opzione D"],
+    "correct": 0,
+    "generated": false
+  }
+]
+
+Regole:
+1. Estrai TUTTE le domande visibili nell'immagine.
+2. NON includere le lettere "A)", "B)" ecc. nelle alternative — solo il testo puro.
+3. Se una risposta è evidenziata in giallo, è quella corretta.
+4. "generated" deve essere sempre false per le domande estratte dalle immagini.
+5. Includi solo domande complete (con almeno 2 alternative visibili).
+6. Restituisci SOLO l'array JSON, senza altro testo o markdown.
+"""
+
+
+MAX_IMAGE_PIXELS = 1920  # longest side — keeps quality while staying under API limits
+
+
+def image_to_base64(path: Path) -> tuple[str, str]:
+    """Load, downscale if needed, and return (base64_str, mime_type)."""
+    from PIL import Image
+    import io
+
+    img = Image.open(path)
+    if max(img.size) > MAX_IMAGE_PIXELS:
+        img.thumbnail((MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    mime = "image/png"
+    return base64.b64encode(buf.getvalue()).decode("utf-8"), mime
+
+
+def extract_questions_from_image(
+    path: Path, client: OpenAI, model: str
+) -> list[dict]:
+    """Send a PNG screenshot to the vision LLM and parse the structured questions."""
+    b64, mime = image_to_base64(path)
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": IMAGE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"},
+                    },
+                    {
+                        "type": "text",
+                        "text": "Estrai tutte le domande d'esame da questa immagine. Identifica le risposte corrette (evidenziate in giallo). Restituisci SOLO l'array JSON.",
+                    },
+                ],
+            },
+        ],
+        temperature=0.1,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        questions = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"  ⚠ JSON parse error for {path.name}: {e}", file=sys.stderr)
+        print(f"  Raw response:\n{raw[:500]}", file=sys.stderr)
+        return []
+
+    if not isinstance(questions, list):
+        print(f"  ⚠ Expected list for {path.name}", file=sys.stderr)
+        return []
+
+    return questions
+
 
 # ─── Text extraction ──────────────────────────────────────────────────────────
 
@@ -213,25 +311,34 @@ def process_professor(
     client: OpenAI,
     model: str,
 ) -> int:
-    """Process all documents for a professor. Returns number of questions extracted."""
+    """Process all documents and images for a professor. Returns number of questions extracted."""
     prof_dir = knoledgebase_dir / professor
     if not prof_dir.is_dir():
         print(f"⚠ Directory not found: {prof_dir}", file=sys.stderr)
         return 0
 
-    supported = {".pdf", ".docx", ".odt"}
-    files = [f for f in prof_dir.iterdir() if f.suffix.lower() in supported]
+    text_extensions = {".pdf", ".docx", ".odt"}
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
 
-    if not files:
+    text_files = [f for f in prof_dir.iterdir() if f.suffix.lower() in text_extensions]
+    image_files = [f for f in prof_dir.iterdir() if f.suffix.lower() in image_extensions]
+
+    if not text_files and not image_files:
         print(f"⚠ No supported files found in {prof_dir}", file=sys.stderr)
         return 0
 
-    print(f"\n📚 Processing professor: {professor} ({len(files)} file(s))")
+    # Always start fresh — delete any existing output
+    out_path = output_dir / f"{professor}.json"
+    if out_path.exists():
+        out_path.unlink()
+        print(f"  🗑  Deleted existing {out_path.name}")
+
+    print(f"\n📚 Processing professor: {professor} ({len(text_files)} document(s), {len(image_files)} image(s))")
 
     all_questions = []
     q_id = 1
 
-    for f in sorted(files):
+    for f in sorted(text_files):
         print(f"  📄 Extracting text from: {f.name}")
         try:
             text = extract_text(f)
@@ -248,6 +355,28 @@ def process_professor(
 
         valid = 0
         for q in raw_questions:
+            q["id"] = q_id
+            validated = validate_question(q, q_id)
+            if validated:
+                all_questions.append(validated)
+                q_id += 1
+                valid += 1
+
+        print(f"  ✓ Extracted {valid} valid questions from {f.name}")
+
+    seen_questions = {q["question"].strip().lower() for q in all_questions}
+
+    for f in sorted(image_files):
+        print(f"  🖼  Processing image: {f.name}")
+        raw_questions = extract_questions_from_image(f, client, model)
+
+        valid = 0
+        for q in raw_questions:
+            key = q["question"].strip().lower()
+            if key in seen_questions:
+                print(f"  ↩  Skipping duplicate: {q['question'][:60]}...")
+                continue
+            seen_questions.add(key)
             q["id"] = q_id
             validated = validate_question(q, q_id)
             if validated:
