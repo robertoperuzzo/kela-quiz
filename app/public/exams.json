@@ -1,5 +1,7 @@
 [
   { "key": "malusa", "name": "Prof. Malusà" },
+  { "key": "malusa-new", "name": "Prof. Malusà (new)" },
   { "key": "messetti", "name": "Prof. Messetti" },
+  { "key": "gestione-gruppo-classe", "name": "Gestione Gruppo Classe" },
   { "key": "zoccante", "name": "Prof. Zoccante" }
 ]

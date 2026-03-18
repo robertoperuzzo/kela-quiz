@@ -8,6 +8,7 @@ A self-hosted multiple-choice quiz webapp for university exam practice.
 kela-quiz/
 ├── knoledgebase/         # Source documents (PDF, DOCX, ODT) per professor
 ├── extraction/           # Python pipeline: documents → structured JSON
+│   └── prompts/          # LLM prompt files (Markdown, one per prompt)
 ├── data/                 # Extracted question JSON files (one per exam)
 ├── app/                  # Svelte + Vite frontend
 ├── Dockerfile            # Multi-stage build (Svelte → nginx)
@@ -45,7 +46,7 @@ python extract.py --professor all --output-dir ../data
 
 Optional flags:
 - `--professor malusa` — process a single professor instead of all
-- `--model gpt-4o` — choose which GitHub Copilot model to use (default: `gpt-4o`)
+- `--model claude-sonnet-4.6` — choose which GitHub Copilot model to use (default: `gpt-4o`)
 
 ### 2. Run locally (dev)
 
@@ -62,6 +63,19 @@ docker compose up -d
 ```
 
 The app is available at http://localhost:8080
+
+## Customising prompts
+
+The LLM prompts used during extraction live in `extraction/prompts/` as Markdown files. You can edit them without touching any Python code:
+
+| File | Used for |
+|------|----------|
+| `text_system.md` | System prompt for text document extraction (PDF, DOCX, ODT) |
+| `text_user.md` | User message template for text extraction (`{professor}`, `{source_file}`, `{text}` placeholders) |
+| `image_system.md` | System prompt for image/screenshot extraction |
+| `image_user.md` | User message sent alongside each image |
+
+After editing a prompt, just re-run the extraction pipeline — no rebuild required.
 
 ## Adding new material
 

@@ -9,14 +9,15 @@ and writes one JSON file per professor to the output directory.
 The output JSON is always deleted and fully regenerated on each run.
 
 Usage:
-    # With GitHub Models API (default):
-    python extract.py --professor all --output-dir ../data
-    python extract.py --professor malusa --model gpt-4o --output-dir ../data
-
-    # With copilot-api proxy (access to Claude, GPT-5.x, etc.):
+    # With copilot-api proxy (default):
     #   1. Start proxy:  npx copilot-api@latest start
     #   2. Run extraction:
-    python extract.py --base-url http://localhost:4141/v1 --model claude-sonnet-4.5 --professor all
+    python extract.py --professor all --output-dir ../data
+    python extract.py --professor malusa --model claude-sonnet-4.6 --output-dir ../data
+    python extract.py --professor malusa --model gpt-5.1 --output-dir ../data
+
+    # With GitHub Models API (GPT-4o only, no Claude/GPT-5):
+    python extract.py --base-url https://models.inference.ai.azure.com --model gpt-4o --professor all
 
 Environment:
     GITHUB_TOKEN  Your GitHub personal access token with Copilot access
@@ -71,36 +72,19 @@ OUTPUT_SCHEMA = {
     },
 }
 
+# ─── Prompt loading ───────────────────────────────────────────────────────────
+
+PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+
+def load_prompt(name: str) -> str:
+    """Load a prompt from a .md file in the prompts directory."""
+    return (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8").strip()
+
+
 # ─── Image helpers ────────────────────────────────────────────────────────────
 
-IMAGE_SYSTEM_PROMPT = """Sei un assistente esperto nell'estrazione strutturata di domande d'esame universitario in italiano.
-
-Ti vengono mostrate immagini di screenshot di un documento Word con domande a risposta multipla.
-Le risposte corrette sono evidenziate in GIALLO nel documento.
-
-Per ogni domanda visibile, estrai:
-- Il testo della domanda
-- Tutte le alternative (A, B, C, D) come testo puro senza la lettera
-- La risposta corretta (quella evidenziata in giallo), indicata come indice 0-based nell'array alternatives
-
-Restituisci SOLO un array JSON valido con questa struttura:
-[
-  {
-    "question": "testo della domanda",
-    "alternatives": ["opzione A", "opzione B", "opzione C", "opzione D"],
-    "correct": 0,
-    "generated": false
-  }
-]
-
-Regole:
-1. Estrai TUTTE le domande visibili nell'immagine.
-2. NON includere le lettere "A)", "B)" ecc. nelle alternative — solo il testo puro.
-3. Se una risposta è evidenziata in giallo, è quella corretta.
-4. "generated" deve essere sempre false per le domande estratte dalle immagini.
-5. Includi solo domande complete (con almeno 2 alternative visibili).
-6. Restituisci SOLO l'array JSON, senza altro testo o markdown.
-"""
+IMAGE_SYSTEM_PROMPT = load_prompt("image_system")
 
 
 MAX_IMAGE_PIXELS = 1920  # longest side — keeps quality while staying under API limits
@@ -140,7 +124,7 @@ def extract_questions_from_image(
                     },
                     {
                         "type": "text",
-                        "text": "Estrai tutte le domande d'esame da questa immagine. Identifica le risposte corrette (evidenziate in giallo). Restituisci SOLO l'array JSON.",
+                        "text": load_prompt("image_user"),
                     },
                 ],
             },
@@ -212,50 +196,16 @@ def extract_text(path: Path) -> str:
 
 # ─── LLM extraction ──────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Sei un assistente esperto nell'estrazione strutturata di domande d'esame universitario in italiano.
-
-Il tuo compito è leggere il testo fornito ed estrarre TUTTE le domande a risposta multipla.
-
-Per ogni domanda, restituisci un oggetto JSON con questa struttura:
-{
-  "question": "testo della domanda",
-  "alternatives": ["opzione A", "opzione B", "opzione C", "opzione D"],
-  "correct": 0,  // indice 0-based dell'alternativa corretta nell'array alternatives
-  "generated": false  // true se hai GENERATO tu le alternative sbagliate
-}
-
-Regole:
-1. Estrai TUTTE le domande presenti nel testo.
-2. Se nel testo ci sono già le alternative (corretta + sbagliate), usale tutte. Metti sempre quella corretta nell'array e segna correct con il suo indice.
-3. Se nel testo c'è SOLO la risposta corretta (senza alternative sbagliate), GENERA tu 3 alternative sbagliate plausibili ma errate in italiano. In questo caso imposta "generated": true.
-4. Ogni domanda deve avere esattamente 4 alternative.
-5. Le alternative devono essere frasi complete e grammaticalmente corrette in italiano.
-6. NON includere lettere come "A)", "B)" nelle alternative — solo il testo puro.
-7. Restituisci SOLO un array JSON valido, senza altro testo.
-
-Esempio di output:
-[
-  {
-    "question": "Qual è la capitale d'Italia?",
-    "alternatives": ["Roma", "Milano", "Napoli", "Torino"],
-    "correct": 0,
-    "generated": false
-  }
-]
-"""
+SYSTEM_PROMPT = load_prompt("text_system")
 
 
 def extract_questions_with_llm(
     text: str, client: OpenAI, model: str, professor: str, source_file: str
 ) -> list[dict]:
     """Send extracted text to the LLM and parse the structured questions."""
-    user_prompt = f"""Estrai tutte le domande d'esame dal seguente testo (professore: {professor}, file: {source_file}):
-
----
-{text}
----
-
-Restituisci SOLO l'array JSON con le domande strutturate."""
+    user_prompt = load_prompt("text_user").format(
+        professor=professor, source_file=source_file, text=text
+    )
 
     response = client.chat.completions.create(
         model=model,
@@ -428,9 +378,9 @@ def main():
     )
     parser.add_argument(
         "--base-url",
-        default="https://models.inference.ai.azure.com",
-        help='API base URL. Use http://localhost:4141/v1 with copilot-api proxy. '
-             'Default: https://models.inference.ai.azure.com',
+        default="http://localhost:4141/v1",
+        help='API base URL. Default: http://localhost:4141/v1 (copilot-api proxy). '
+             'Start the proxy with: npx copilot-api@latest start',
     )
     parser.add_argument(
         "--output-dir",
@@ -449,6 +399,18 @@ def main():
         print("❌ GITHUB_TOKEN environment variable not set.", file=sys.stderr)
         print("   Set it to your GitHub personal access token with Copilot access.", file=sys.stderr)
         sys.exit(1)
+
+    import urllib.request
+    import urllib.error
+
+    proxy_url = args.base_url
+    if "localhost" in proxy_url or "127.0.0.1" in proxy_url:
+        try:
+            urllib.request.urlopen(proxy_url.rstrip("/").rsplit("/", 1)[0] + "/", timeout=2)
+        except Exception:
+            print("❌ Cannot reach the copilot-api proxy at:", proxy_url, file=sys.stderr)
+            print("   Start it with:  npx copilot-api@latest start", file=sys.stderr)
+            sys.exit(1)
 
     client = OpenAI(
         base_url=args.base_url,
